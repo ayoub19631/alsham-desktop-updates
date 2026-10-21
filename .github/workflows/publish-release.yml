@@ -1,0 +1,91 @@
+name: publish-release
+
+# Publishes one desktop installer as a GitHub Release of this public channel.
+# The installer is pushed by the maintainer's cloud session onto a short-lived
+# branch (publish/v<version>) together with its release notes; this job checks
+# the SHA256 against the expected value, creates the release with the job's
+# own GITHUB_TOKEN, verifies the public download hash, and deletes the branch.
+# No stored secret is used. Published releases are immutable: an existing tag
+# fails the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish (major.minor.patch)
+        type: string
+        required: true
+      expected_sha256:
+        description: SHA256 of AlshamFactory_Setup_v<version>.exe (64 hex chars)
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      EXPECTED: ${{ inputs.expected_sha256 }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad version"; exit 1; }
+          [[ "$EXPECTED" =~ ^[0-9A-Fa-f]{64}$ ]] || { echo "bad sha256"; exit 1; }
+          if gh release view "v$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists. Published versions are immutable; increment the version."; exit 1
+          fi
+
+      - name: Check out the publish branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: publish/v${{ inputs.version }}
+          persist-credentials: false
+
+      - name: Verify installer hash
+        run: |
+          set -euo pipefail
+          exe="AlshamFactory_Setup_v$VERSION.exe"
+          [[ -f "$exe" && -f notes.md ]] || { echo "installer or notes.md missing on the publish branch"; exit 1; }
+          actual=$(sha256sum "$exe" | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          expected=$(echo "$EXPECTED" | tr 'a-f' 'A-F')
+          echo "actual   $actual"; echo "expected $expected"
+          [[ "$actual" == "$expected" ]] || { echo "SHA256 mismatch"; exit 1; }
+          grep -q "$expected" notes.md || { echo "notes.md does not state the SHA256"; exit 1; }
+
+      - name: Create the public release
+        run: |
+          set -euo pipefail
+          gh release create "v$VERSION" -R "$GITHUB_REPOSITORY" \
+            --target main \
+            --title "AL SHAM Desktop v$VERSION" \
+            --notes-file notes.md \
+            "AlshamFactory_Setup_v$VERSION.exe#AlshamFactory_Setup_v$VERSION.exe"
+
+      - name: Verify the public download
+        run: |
+          set -euo pipefail
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/AlshamFactory_Setup_v$VERSION.exe"
+          for i in 1 2 3 4 5 6; do
+            if curl -fsSL -o public.exe "$url"; then break; fi
+            echo "download attempt $i failed; retrying"; sleep 10
+          done
+          public=$(sha256sum public.exe | cut -d' ' -f1 | tr 'a-f' 'A-F')
+          expected=$(echo "$EXPECTED" | tr 'a-f' 'A-F')
+          echo "public   $public"
+          [[ "$public" == "$expected" ]] || { echo "Public download hash does not match"; exit 1; }
+          echo "Public download OK: $url"
+
+      - name: Delete the publish branch
+        run: |
+          set -euo pipefail
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/publish/v$VERSION"
